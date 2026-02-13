@@ -60,7 +60,16 @@ class _VncConnectPageState extends State<VncConnectPage> {
     if (manager.state == VncConnectionState.connected) {
       setState(() => _isConnecting = false);
 
-      Navigator.of(context).push(MaterialPageRoute<void>(builder: (context) => VncViewerPage(manager: manager)));
+      Navigator.of(context).push(
+        PageRouteBuilder<void>(
+          pageBuilder: (context, animation, secondaryAnimation) => VncViewerPage(manager: manager),
+          transitionsBuilder: (context, animation, secondaryAnimation, child) {
+            return FadeTransition(opacity: CurvedAnimation(parent: animation, curve: Curves.easeInOut), child: child);
+          },
+          transitionDuration: const Duration(milliseconds: 300),
+          reverseTransitionDuration: const Duration(milliseconds: 250),
+        ),
+      );
     } else {
       setState(() {
         _isConnecting = false;
@@ -168,7 +177,7 @@ class _VncConnectPageState extends State<VncConnectPage> {
     return TextFormField(
       controller: _passwordController,
       decoration: InputDecoration(
-        labelText: 'Password (optional)',
+        labelText: 'Password (required)',
         prefixIcon: const Icon(Icons.lock_outline),
         border: const OutlineInputBorder(),
         suffixIcon: IconButton(
