@@ -20,7 +20,7 @@ class _VncConnectPageState extends State<VncConnectPage> {
   final _formKey = GlobalKey<FormState>();
   final _hostController = TextEditingController(text: '10.100.100.143');
   final _portController = TextEditingController(text: '5901');
-  final _passwordController = TextEditingController();
+  final _passwordController = TextEditingController(text: 'abc');
 
   bool _isConnecting = false;
   bool _obscurePassword = true;
