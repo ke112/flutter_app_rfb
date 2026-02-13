@@ -29,6 +29,11 @@ class _VncViewerPageState extends State<VncViewerPage> {
   /// 页面是否正在退出中（防止 dispose 期间的回调冲突）。
   bool _isExiting = false;
 
+  /// 是否将触摸事件映射为鼠标事件发送到 VNC 服务器。
+  /// 设为 false 时，触摸仅用于缩放/平移查看画面，不影响远程桌面。
+  /// 后期可通过 UI 开关或设置页面改为 true 以启用远程鼠标控制。
+  bool _enableMouseEvents = false;
+
   @override
   void initState() {
     super.initState();
@@ -175,6 +180,15 @@ class _VncViewerPageState extends State<VncViewerPage> {
           leading: IconButton(icon: const Icon(Icons.close), onPressed: () => _onWillPop()),
           actions: [
             IconButton(
+              icon: Icon(_enableMouseEvents ? Icons.mouse : Icons.mouse_outlined),
+              tooltip: _enableMouseEvents ? '鼠标控制：开' : '鼠标控制：关',
+              onPressed: () {
+                setState(() {
+                  _enableMouseEvents = !_enableMouseEvents;
+                });
+              },
+            ),
+            IconButton(
               icon: const Icon(Icons.zoom_in_map_rounded),
               tooltip: '重置缩放',
               onPressed: () {
@@ -209,38 +223,43 @@ class _VncViewerPageState extends State<VncViewerPage> {
       builder: (context, constraints) {
         final Size widgetSize = Size(constraints.maxWidth, constraints.maxHeight);
 
+        final Widget imageWidget = RepaintBoundary(
+          child: Center(
+            child: AspectRatio(
+              aspectRatio: _manager.frameBufferWidth / _manager.frameBufferHeight,
+              child: RawImage(image: image, fit: BoxFit.contain, filterQuality: FilterQuality.medium),
+            ),
+          ),
+        );
+
         return InteractiveViewer(
           transformationController: _transformController,
           constrained: true,
           maxScale: 10,
           minScale: 0.5,
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTapDown: (details) {
-              _handlePointer(details.localPosition, widgetSize, pressed: true);
-            },
-            onTapUp: (details) {
-              _handlePointer(details.localPosition, widgetSize, pressed: false);
-            },
-            onPanStart: (details) {
-              _handlePointer(details.localPosition, widgetSize, pressed: true);
-            },
-            onPanUpdate: (details) {
-              _handlePointer(details.localPosition, widgetSize, pressed: true);
-            },
-            onPanEnd: (details) {
-              _manager.sendPointerEvent(x: 0, y: 0, button1Down: false);
-            },
-            // RepaintBoundary 隔离帧画面重绘，避免影响父级组件
-            child: RepaintBoundary(
-              child: Center(
-                child: AspectRatio(
-                  aspectRatio: _manager.frameBufferWidth / _manager.frameBufferHeight,
-                  child: RawImage(image: image, fit: BoxFit.contain, filterQuality: FilterQuality.medium),
-                ),
-              ),
-            ),
-          ),
+          // 鼠标控制关闭时，InteractiveViewer 独占手势用于缩放/平移
+          // 鼠标控制开启时，内部 GestureDetector 拦截单指操作转发为鼠标事件
+          child: _enableMouseEvents
+              ? GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (details) {
+                    _handlePointer(details.localPosition, widgetSize, pressed: true);
+                  },
+                  onTapUp: (details) {
+                    _handlePointer(details.localPosition, widgetSize, pressed: false);
+                  },
+                  onPanStart: (details) {
+                    _handlePointer(details.localPosition, widgetSize, pressed: true);
+                  },
+                  onPanUpdate: (details) {
+                    _handlePointer(details.localPosition, widgetSize, pressed: true);
+                  },
+                  onPanEnd: (details) {
+                    _manager.sendPointerEvent(x: 0, y: 0, button1Down: false);
+                  },
+                  child: imageWidget,
+                )
+              : imageWidget,
         );
       },
     );
