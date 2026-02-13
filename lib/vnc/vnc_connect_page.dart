@@ -18,8 +18,8 @@ class VncConnectPage extends StatefulWidget {
 
 class _VncConnectPageState extends State<VncConnectPage> {
   final _formKey = GlobalKey<FormState>();
-  final _hostController = TextEditingController(text: '192.168.1.');
-  final _portController = TextEditingController(text: '5900');
+  final _hostController = TextEditingController(text: '10.100.100.143');
+  final _portController = TextEditingController(text: '5901');
   final _passwordController = TextEditingController();
 
   bool _isConnecting = false;
@@ -45,9 +45,7 @@ class _VncConnectPageState extends State<VncConnectPage> {
     final config = VncConnectionConfig(
       host: _hostController.text.trim(),
       port: int.parse(_portController.text.trim()),
-      password: _passwordController.text.isNotEmpty
-          ? _passwordController.text
-          : null,
+      password: _passwordController.text.isNotEmpty ? _passwordController.text : null,
     );
 
     final manager = VncClientManager();
@@ -62,16 +60,11 @@ class _VncConnectPageState extends State<VncConnectPage> {
     if (manager.state == VncConnectionState.connected) {
       setState(() => _isConnecting = false);
 
-      Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (context) => VncViewerPage(manager: manager),
-        ),
-      );
+      Navigator.of(context).push(MaterialPageRoute<void>(builder: (context) => VncViewerPage(manager: manager)));
     } else {
       setState(() {
         _isConnecting = false;
-        _errorMessage =
-            manager.errorMessage ?? 'Connection failed';
+        _errorMessage = manager.errorMessage ?? 'Connection failed';
       });
       manager.dispose();
     }
@@ -82,41 +75,27 @@ class _VncConnectPageState extends State<VncConnectPage> {
     final theme = Theme.of(context);
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('VNC Client'),
-        centerTitle: true,
-      ),
+      appBar: AppBar(title: const Text('VNC Client'), centerTitle: true),
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsetsDirectional.symmetric(
-            horizontal: 24,
-            vertical: 32,
-          ),
+          padding: const EdgeInsetsDirectional.symmetric(horizontal: 24, vertical: 32),
           child: Form(
             key: _formKey,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Icon(
-                  Icons.desktop_windows_rounded,
-                  size: 64,
-                  color: theme.colorScheme.primary,
-                ),
+                Icon(Icons.desktop_windows_rounded, size: 64, color: theme.colorScheme.primary),
                 const SizedBox(height: 8),
                 Text(
                   'Remote Desktop',
                   textAlign: TextAlign.center,
-                  style: theme.textTheme.headlineSmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
+                  style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 4),
                 Text(
                   'Connect to a VNC server',
                   textAlign: TextAlign.center,
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
+                  style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
                 ),
                 const SizedBox(height: 32),
                 _buildHostField(),
@@ -193,11 +172,7 @@ class _VncConnectPageState extends State<VncConnectPage> {
         prefixIcon: const Icon(Icons.lock_outline),
         border: const OutlineInputBorder(),
         suffixIcon: IconButton(
-          icon: Icon(
-            _obscurePassword
-                ? Icons.visibility_off_outlined
-                : Icons.visibility_outlined,
-          ),
+          icon: Icon(_obscurePassword ? Icons.visibility_off_outlined : Icons.visibility_outlined),
           onPressed: () {
             setState(() => _obscurePassword = !_obscurePassword);
           },
@@ -216,28 +191,17 @@ class _VncConnectPageState extends State<VncConnectPage> {
       child: Container(
         padding: const EdgeInsetsDirectional.all(12),
         decoration: BoxDecoration(
-          color: Theme.of(context)
-              .colorScheme
-              .errorContainer,
+          color: Theme.of(context).colorScheme.errorContainer,
           borderRadius: BorderRadiusDirectional.circular(8),
         ),
         child: Row(
           children: [
-            Icon(
-              Icons.error_outline,
-              color: Theme.of(context).colorScheme.error,
-              size: 20,
-            ),
+            Icon(Icons.error_outline, color: Theme.of(context).colorScheme.error, size: 20),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
                 _errorMessage!,
-                style: TextStyle(
-                  color: Theme.of(context)
-                      .colorScheme
-                      .onErrorContainer,
-                  fontSize: 13,
-                ),
+                style: TextStyle(color: Theme.of(context).colorScheme.onErrorContainer, fontSize: 13),
               ),
             ),
           ],
@@ -249,23 +213,18 @@ class _VncConnectPageState extends State<VncConnectPage> {
   Widget _buildConnectButton() {
     return FilledButton.icon(
       onPressed: _isConnecting ? null : _onConnect,
-      icon: _isConnecting
-          ? const SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.white70,
-              ),
-            )
-          : const Icon(Icons.play_arrow_rounded),
+      icon:
+          _isConnecting
+              ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white70),
+              )
+              : const Icon(Icons.play_arrow_rounded),
       label: Text(_isConnecting ? 'Connecting...' : 'Connect'),
       style: FilledButton.styleFrom(
         minimumSize: const Size.fromHeight(48),
-        textStyle: const TextStyle(
-          fontSize: 16,
-          fontWeight: FontWeight.w600,
-        ),
+        textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
       ),
     );
   }
@@ -276,11 +235,7 @@ class _VncConnectPageState extends State<VncConnectPage> {
       '  Android Emulator → use 10.0.2.2\n'
       '  iOS Simulator / Real Device → use LAN IP',
       textAlign: TextAlign.center,
-      style: theme.textTheme.bodySmall?.copyWith(
-        color: theme.colorScheme.onSurfaceVariant.withValues(
-          alpha: 0.7,
-        ),
-      ),
+      style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.7)),
     );
   }
 }
