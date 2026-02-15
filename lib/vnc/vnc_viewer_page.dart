@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -34,6 +35,17 @@ class _VncViewerPageState extends State<VncViewerPage> {
   /// 后期可通过 UI 开关或设置页面改为 true 以启用远程鼠标控制。
   bool _enableMouseEvents = false;
 
+  /// ---------- 触摸暂停渲染 ----------
+
+  /// 当前屏幕上活跃的触摸指针数量。
+  int _activePointers = 0;
+
+  /// 手指全部抬起后，延迟恢复渲染的定时器。
+  Timer? _resumeTimer;
+
+  /// 手指离开后恢复渲染的延迟时间（缩短以减少恢复等待感）。
+  static const Duration _resumeDelay = Duration(milliseconds: 150);
+
   @override
   void initState() {
     super.initState();
@@ -42,6 +54,7 @@ class _VncViewerPageState extends State<VncViewerPage> {
 
   @override
   void dispose() {
+    _resumeTimer?.cancel();
     // 先移除监听器，再断开连接，避免 disconnect 触发的回调导致问题
     _manager.removeListener(_onManagerUpdate);
     _manager.disconnect(silent: true);
@@ -57,6 +70,10 @@ class _VncViewerPageState extends State<VncViewerPage> {
       _showDisconnectedDialog();
       return;
     }
+
+    // 触摸交互期间（含延迟恢复等待期），跳过帧 setState，
+    // 让 InteractiveViewer 对静态图做变换，保证丝滑。
+    if (_activePointers > 0 || _resumeTimer != null) return;
 
     // 仅更新帧画面区域
     setState(() {});
@@ -232,34 +249,42 @@ class _VncViewerPageState extends State<VncViewerPage> {
           ),
         );
 
-        return InteractiveViewer(
-          transformationController: _transformController,
-          constrained: true,
-          maxScale: 10,
-          minScale: 0.5,
-          // 鼠标控制关闭时，InteractiveViewer 独占手势用于缩放/平移
-          // 鼠标控制开启时，内部 GestureDetector 拦截单指操作转发为鼠标事件
-          child: _enableMouseEvents
-              ? GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTapDown: (details) {
-                    _handlePointer(details.localPosition, widgetSize, pressed: true);
-                  },
-                  onTapUp: (details) {
-                    _handlePointer(details.localPosition, widgetSize, pressed: false);
-                  },
-                  onPanStart: (details) {
-                    _handlePointer(details.localPosition, widgetSize, pressed: true);
-                  },
-                  onPanUpdate: (details) {
-                    _handlePointer(details.localPosition, widgetSize, pressed: true);
-                  },
-                  onPanEnd: (details) {
-                    _manager.sendPointerEvent(x: 0, y: 0, button1Down: false);
-                  },
-                  child: imageWidget,
-                )
-              : imageWidget,
+        // 用 Listener 拦截原始指针事件，实现触摸期间暂停渲染。
+        // Listener 不消费手势，不会影响 InteractiveViewer 的缩放/平移。
+        return Listener(
+          onPointerDown: (_) => _onPointerDown(),
+          onPointerUp: (_) => _onPointerUp(),
+          onPointerCancel: (_) => _onPointerUp(),
+          child: InteractiveViewer(
+            transformationController: _transformController,
+            constrained: true,
+            maxScale: 10,
+            minScale: 0.5,
+            // 鼠标控制关闭时，InteractiveViewer 独占手势用于缩放/平移
+            // 鼠标控制开启时，内部 GestureDetector 拦截单指操作转发为鼠标事件
+            child:
+                _enableMouseEvents
+                    ? GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: (details) {
+                        _handlePointer(details.localPosition, widgetSize, pressed: true);
+                      },
+                      onTapUp: (details) {
+                        _handlePointer(details.localPosition, widgetSize, pressed: false);
+                      },
+                      onPanStart: (details) {
+                        _handlePointer(details.localPosition, widgetSize, pressed: true);
+                      },
+                      onPanUpdate: (details) {
+                        _handlePointer(details.localPosition, widgetSize, pressed: true);
+                      },
+                      onPanEnd: (details) {
+                        _manager.sendPointerEvent(x: 0, y: 0, button1Down: false);
+                      },
+                      child: imageWidget,
+                    )
+                    : imageWidget,
+          ),
         );
       },
     );
@@ -270,5 +295,36 @@ class _VncViewerPageState extends State<VncViewerPage> {
     if (fbCoords == null) return;
 
     _manager.sendPointerEvent(x: fbCoords.dx.toInt(), y: fbCoords.dy.toInt(), button1Down: pressed);
+  }
+
+  // ---------- 触摸暂停/恢复渲染 ----------
+
+  /// 手指按下：暂停渲染，取消恢复定时器。
+  void _onPointerDown() {
+    _resumeTimer?.cancel();
+    _resumeTimer = null;
+    _activePointers++;
+
+    if (_activePointers == 1) {
+      // 第一根手指落下，立即暂停渲染
+      _manager.pauseRendering();
+    }
+  }
+
+  /// 手指抬起或取消：当所有手指离开后，启动延迟恢复定时器。
+  void _onPointerUp() {
+    _activePointers = (_activePointers - 1).clamp(0, 99);
+
+    if (_activePointers == 0) {
+      // 所有手指离开，延迟恢复渲染
+      _resumeTimer?.cancel();
+      _resumeTimer = Timer(_resumeDelay, () {
+        // 关键：必须先清除定时器引用，否则 _onManagerUpdate 中
+        // _resumeTimer != null 检查会永远跳过 setState，导致画面冻结。
+        _resumeTimer = null;
+        if (!mounted) return;
+        _manager.resumeRendering();
+      });
+    }
   }
 }

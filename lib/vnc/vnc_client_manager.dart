@@ -71,6 +71,15 @@ class VncClientManager extends ChangeNotifier {
   /// 是否有待处理的帧更新（节流：处理期间来的更新合并为一次）。
   bool _hasPendingUpdate = false;
 
+  /// 渲染是否已暂停（触摸交互期间暂停，以避免 setState 抖动）。
+  ///
+  /// 暂停期间仍接收帧数据并写入缓冲区，但跳过图像解码和 UI 通知，
+  /// 恢复时立即解码最新缓冲区并刷新画面。
+  bool _renderingPaused = false;
+
+  /// 暂停期间缓冲区是否有新数据写入（恢复时需要解码）。
+  bool _dirtyWhilePaused = false;
+
   /// 帧率节流：最小帧间隔（约 30fps）。
   static const Duration _minFrameInterval = Duration(milliseconds: 33);
   DateTime _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
@@ -89,6 +98,30 @@ class VncClientManager extends ChangeNotifier {
 
   /// 帧缓冲区高度（像素）。
   int get frameBufferHeight => _frameBufferHeight;
+
+  /// 暂停渲染（触摸开始时调用）。
+  ///
+  /// 数据仍然写入帧缓冲区，但不解码为 Image、不通知 UI。
+  void pauseRendering() {
+    _renderingPaused = true;
+    _dirtyWhilePaused = false;
+  }
+
+  /// 恢复渲染（触摸结束一段时间后调用）。
+  ///
+  /// 如果暂停期间有新数据，立即解码缓冲区并刷新画面；
+  /// 否则直接请求下一帧以重启更新循环。
+  void resumeRendering() {
+    if (!_renderingPaused) return;
+    _renderingPaused = false;
+    if (_dirtyWhilePaused) {
+      _dirtyWhilePaused = false;
+      _decodeAndNotify(); // 解码后回调中会自动 requestUpdate
+    } else {
+      // 暂停期间没有新数据到达，手动重启更新循环
+      _client?.requestUpdate();
+    }
+  }
 
   /// 连接到 VNC 服务器。
   ///
@@ -274,6 +307,14 @@ class VncClientManager extends ChangeNotifier {
       }
     }
 
+    // 渲染暂停时：数据已写入缓冲区，跳过解码，
+    // 但继续 requestUpdate 保持数据流新鲜，恢复时可立即显示最新画面。
+    if (_renderingPaused) {
+      _dirtyWhilePaused = true;
+      _client?.requestUpdate();
+      return;
+    }
+
     // 帧率节流
     final now = DateTime.now();
     if (now.difference(_lastFrameTime) < _minFrameInterval) {
@@ -282,6 +323,11 @@ class VncClientManager extends ChangeNotifier {
         Future.delayed(_minFrameInterval, () {
           if (_isDisposed) return;
           _hasPendingUpdate = false;
+          if (_renderingPaused) {
+            _dirtyWhilePaused = true;
+            _client?.requestUpdate();
+            return;
+          }
           _decodeAndNotify();
         });
       }
