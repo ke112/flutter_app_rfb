@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:ui' as ui;
 
 import 'package:dart_rfb/dart_rfb.dart';
@@ -22,27 +23,158 @@ enum VncConnectionState {
   error,
 }
 
-/// 单个矩形更新数据。
-class _RectUpdateData {
-  final Uint8List byteData;
-  final int x;
-  final int y;
-  final int width;
-  final int height;
-  final bool isCopyRect;
-  final int sourceX;
-  final int sourceY;
+/// 在后台 Isolate 中管理帧缓冲区的像素操作。
+///
+/// 将 CPU 密集型的矩形像素写入和缓冲区快照复制移至独立 Isolate，
+/// 避免阻塞 UI 线程导致 Android ANR。
+class _FrameBufferProcessor {
+  Isolate? _isolate;
+  SendPort? _commandPort;
+  bool _disposed = false;
 
-  _RectUpdateData({
-    required this.byteData,
-    required this.x,
-    required this.y,
-    required this.width,
-    required this.height,
-    this.isCopyRect = false,
-    this.sourceX = 0,
-    this.sourceY = 0,
-  });
+  bool get isReady => _commandPort != null && !_disposed;
+
+  Future<void> start(int width, int height) async {
+    final receiver = ReceivePort();
+    _isolate = await Isolate.spawn(_isolateEntry, receiver.sendPort);
+    _commandPort = await receiver.first as SendPort;
+    _commandPort!.send(['init', width, height]);
+  }
+
+  /// 发送矩形更新到 Isolate（非阻塞 fire-and-forget）。
+  ///
+  /// 每个矩形为一个 List：
+  /// - Raw:      [false, x, y, w, h, Uint8List bytes]
+  /// - CopyRect: [true,  x, y, w, h, sourceX, sourceY]
+  void applyRects(List<List<Object>> rects) {
+    _commandPort?.send(['rects', rects]);
+  }
+
+  /// 请求当前帧缓冲区快照，用于图像解码。
+  ///
+  /// 使用 [TransferableTypedData] 实现零拷贝跨 Isolate 传输。
+  Future<Uint8List?> snapshot() async {
+    if (!isReady) return null;
+    final receiver = ReceivePort();
+    try {
+      _commandPort!.send(['snap', receiver.sendPort]);
+      final result = await receiver.first.timeout(
+        const Duration(milliseconds: 500),
+        onTimeout: () => null,
+      );
+      if (result is TransferableTypedData) {
+        return result.materialize().asUint8List();
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      receiver.close();
+    }
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    try {
+      _commandPort?.send(['exit']);
+    } catch (_) {}
+    _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
+    _commandPort = null;
+  }
+
+  // --------------- Isolate 入口及像素操作 ---------------
+
+  static void _isolateEntry(SendPort mainPort) {
+    final port = ReceivePort();
+    mainPort.send(port.sendPort);
+
+    Uint8List? fb;
+    int fbW = 0;
+    int fbH = 0;
+
+    port.listen((msg) {
+      if (msg is! List || msg.isEmpty) return;
+      switch (msg[0]) {
+        case 'init':
+          fbW = msg[1] as int;
+          fbH = msg[2] as int;
+          fb = Uint8List(fbW * fbH * 4);
+
+        case 'rects':
+          if (fb == null) return;
+          final rects = msg[1] as List;
+          for (final r in rects) {
+            final rect = r as List;
+            if (rect[0] as bool) {
+              _applyCopyRect(fb!, fbW, rect);
+            } else {
+              _applyRawRect(fb!, fbW, fbH, rect);
+            }
+          }
+
+        case 'snap':
+          final replyPort = msg[1] as SendPort;
+          if (fb != null) {
+            replyPort.send(
+              TransferableTypedData.fromList([Uint8List.fromList(fb!)]),
+            );
+          } else {
+            replyPort.send(null);
+          }
+
+        case 'exit':
+          fb = null;
+          port.close();
+      }
+    });
+  }
+
+  static void _applyRawRect(Uint8List fb, int fbW, int fbH, List rect) {
+    final int x = rect[1] as int;
+    final int y = rect[2] as int;
+    final int rw = rect[3] as int;
+    final int rh = rect[4] as int;
+    final Uint8List src = rect[5] as Uint8List;
+    final int cw = rw.clamp(0, fbW - x);
+    final int ch = rh.clamp(0, fbH - y);
+    final int rowBytes = cw * 4;
+
+    for (int row = 0; row < ch; row++) {
+      final int sOff = row * rw * 4;
+      final int dOff = ((y + row) * fbW + x) * 4;
+      if (sOff + rowBytes <= src.length && dOff + rowBytes <= fb.length) {
+        fb.setRange(dOff, dOff + rowBytes, src, sOff);
+      }
+    }
+  }
+
+  static void _applyCopyRect(Uint8List fb, int fbW, List rect) {
+    final int x = rect[1] as int;
+    final int y = rect[2] as int;
+    final int rw = rect[3] as int;
+    final int rh = rect[4] as int;
+    final int sx = rect[5] as int;
+    final int sy = rect[6] as int;
+    final int rowBytes = rw * 4;
+    final temp = Uint8List(rw * rh * 4);
+
+    for (int row = 0; row < rh; row++) {
+      final sOff = ((sy + row) * fbW + sx) * 4;
+      final tOff = row * rowBytes;
+      if (sOff + rowBytes <= fb.length && tOff + rowBytes <= temp.length) {
+        temp.setRange(tOff, tOff + rowBytes, fb, sOff);
+      }
+    }
+    for (int row = 0; row < rh; row++) {
+      final dOff = ((y + row) * fbW + x) * 4;
+      final tOff = row * rowBytes;
+      if (dOff + rowBytes <= fb.length && tOff + rowBytes <= temp.length) {
+        fb.setRange(dOff, dOff + rowBytes, temp, tOff);
+      }
+    }
+  }
 }
 
 /// VNC 客户端核心管理器。
@@ -60,7 +192,9 @@ class VncClientManager extends ChangeNotifier {
   ui.Image? _currentImage;
   int _frameBufferWidth = 0;
   int _frameBufferHeight = 0;
-  Uint8List? _frameBuffer;
+
+  /// 后台 Isolate 帧缓冲区处理器。
+  _FrameBufferProcessor _fbProcessor = _FrameBufferProcessor();
 
   /// 是否已被 dispose，防止 dispose 后继续操作。
   bool _isDisposed = false;
@@ -72,16 +206,13 @@ class VncClientManager extends ChangeNotifier {
   bool _hasPendingUpdate = false;
 
   /// 渲染是否已暂停（触摸交互期间暂停，以避免 setState 抖动）。
-  ///
-  /// 暂停期间仍接收帧数据并写入缓冲区，但跳过图像解码和 UI 通知，
-  /// 恢复时立即解码最新缓冲区并刷新画面。
   bool _renderingPaused = false;
 
   /// 暂停期间缓冲区是否有新数据写入（恢复时需要解码）。
   bool _dirtyWhilePaused = false;
 
-  /// 帧率节流：最小帧间隔（约 30fps）。
-  static const Duration _minFrameInterval = Duration(milliseconds: 33);
+  /// 帧率节流：最小帧间隔（约 20fps，降低移动设备 CPU 负载）。
+  static const Duration _minFrameInterval = Duration(milliseconds: 50);
   DateTime _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 当前连接状态。
@@ -101,7 +232,7 @@ class VncClientManager extends ChangeNotifier {
 
   /// 暂停渲染（触摸开始时调用）。
   ///
-  /// 数据仍然写入帧缓冲区，但不解码为 Image、不通知 UI。
+  /// 数据仍然发送到后台 Isolate 写入帧缓冲区，但不解码为 Image、不通知 UI。
   void pauseRendering() {
     _renderingPaused = true;
     _dirtyWhilePaused = false;
@@ -109,16 +240,15 @@ class VncClientManager extends ChangeNotifier {
 
   /// 恢复渲染（触摸结束一段时间后调用）。
   ///
-  /// 如果暂停期间有新数据，立即解码缓冲区并刷新画面；
+  /// 如果暂停期间有新数据，立即从 Isolate 获取快照并解码刷新画面；
   /// 否则直接请求下一帧以重启更新循环。
   void resumeRendering() {
     if (!_renderingPaused) return;
     _renderingPaused = false;
     if (_dirtyWhilePaused) {
       _dirtyWhilePaused = false;
-      _decodeAndNotify(); // 解码后回调中会自动 requestUpdate
+      _decodeAndNotify();
     } else {
-      // 暂停期间没有新数据到达，手动重启更新循环
       _client?.requestUpdate();
     }
   }
@@ -152,13 +282,15 @@ class VncClientManager extends ChangeNotifier {
         (final Config cfg) {
           _frameBufferWidth = cfg.frameBufferWidth;
           _frameBufferHeight = cfg.frameBufferHeight;
-          _frameBuffer = Uint8List(_frameBufferWidth * _frameBufferHeight * 4);
           _logger.info(
             'Framebuffer size: '
             '${_frameBufferWidth}x$_frameBufferHeight',
           );
         },
       );
+
+      _fbProcessor = _FrameBufferProcessor();
+      await _fbProcessor.start(_frameBufferWidth, _frameBufferHeight);
 
       _state = VncConnectionState.connected;
       notifyListeners();
@@ -242,80 +374,60 @@ class VncClientManager extends ChangeNotifier {
     _client!.requestUpdate();
   }
 
-  /// 处理一次帧缓冲区更新（带节流和并发保护）。
+  /// 处理一次帧缓冲区更新。
+  ///
+  /// 矩形像素数据序列化后发送到后台 Isolate 处理，
+  /// 主线程只做轻量级数据封装，不执行任何像素操作。
   void _onFrameBufferUpdate(RemoteFrameBufferClientUpdate update) {
-    if (_isDisposed) return;
+    if (_isDisposed || !_fbProcessor.isReady) return;
 
-    final Uint8List? fb = _frameBuffer;
-    if (fb == null) return;
-
-    // 收集矩形更新数据
-    final List<_RectUpdateData> rectDataList = [];
+    final List<List<Object>> serializedRects = [];
     for (final rectangle in update.rectangles) {
       rectangle.encodingType.when(
         copyRect: () {
           if (rectangle.byteData.lengthInBytes < 4) return;
-          rectDataList.add(
-            _RectUpdateData(
-              byteData: Uint8List.fromList(
-                rectangle.byteData.buffer.asUint8List(
-                  rectangle.byteData.offsetInBytes,
-                  rectangle.byteData.lengthInBytes,
-                ),
-              ),
-              x: rectangle.x,
-              y: rectangle.y,
-              width: rectangle.width,
-              height: rectangle.height,
-              isCopyRect: true,
-              sourceX: rectangle.byteData.getUint16(0),
-              sourceY: rectangle.byteData.getUint16(2),
-            ),
-          );
+          serializedRects.add([
+            true,
+            rectangle.x,
+            rectangle.y,
+            rectangle.width,
+            rectangle.height,
+            rectangle.byteData.getUint16(0),
+            rectangle.byteData.getUint16(2),
+          ]);
         },
         raw: () {
-          rectDataList.add(
-            _RectUpdateData(
-              byteData: Uint8List.fromList(
-                rectangle.byteData.buffer.asUint8List(
-                  rectangle.byteData.offsetInBytes,
-                  rectangle.byteData.lengthInBytes,
-                ),
+          serializedRects.add([
+            false,
+            rectangle.x,
+            rectangle.y,
+            rectangle.width,
+            rectangle.height,
+            Uint8List.fromList(
+              rectangle.byteData.buffer.asUint8List(
+                rectangle.byteData.offsetInBytes,
+                rectangle.byteData.lengthInBytes,
               ),
-              x: rectangle.x,
-              y: rectangle.y,
-              width: rectangle.width,
-              height: rectangle.height,
             ),
-          );
+          ]);
         },
         unsupported: (final ByteData bytes) {},
       );
     }
 
-    if (rectDataList.isEmpty) {
+    if (serializedRects.isEmpty) {
       _client?.requestUpdate();
       return;
     }
 
-    // 先在主线程快速应用像素更新到缓冲区（小更新时更快）
-    for (final rect in rectDataList) {
-      if (rect.isCopyRect) {
-        _applyCopyRectFast(fb, rect);
-      } else {
-        _applyRawRectFast(fb, rect);
-      }
-    }
+    _fbProcessor.applyRects(serializedRects);
 
-    // 渲染暂停时：数据已写入缓冲区，跳过解码，
-    // 但继续 requestUpdate 保持数据流新鲜，恢复时可立即显示最新画面。
     if (_renderingPaused) {
       _dirtyWhilePaused = true;
       _client?.requestUpdate();
       return;
     }
 
-    // 帧率节流
     final now = DateTime.now();
     if (now.difference(_lastFrameTime) < _minFrameInterval) {
       if (!_hasPendingUpdate) {
@@ -337,78 +449,46 @@ class VncClientManager extends ChangeNotifier {
     _decodeAndNotify();
   }
 
-  /// 快速 Raw 矩形应用（按行批量复制，替代逐像素操作）。
-  void _applyRawRectFast(Uint8List fb, _RectUpdateData rect) {
-    final Uint8List src = rect.byteData;
-    final int copyWidth = rect.width.clamp(0, _frameBufferWidth - rect.x);
-    final int copyHeight = rect.height.clamp(0, _frameBufferHeight - rect.y);
-    final int bytesPerRow = copyWidth * 4;
-
-    for (int y = 0; y < copyHeight; y++) {
-      final int srcRowStart = y * rect.width * 4;
-      final int dstRowStart = ((rect.y + y) * _frameBufferWidth + rect.x) * 4;
-
-      if (srcRowStart + bytesPerRow <= src.length && dstRowStart + bytesPerRow <= fb.length) {
-        fb.setRange(dstRowStart, dstRowStart + bytesPerRow, src, srcRowStart);
-      }
-    }
-  }
-
-  /// 快速 CopyRect 应用（按行批量复制）。
-  void _applyCopyRectFast(Uint8List fb, _RectUpdateData rect) {
-    final int sourceX = rect.sourceX;
-    final int sourceY = rect.sourceY;
-    final int rowBytes = rect.width * 4;
-    final Uint8List tempBuf = Uint8List(rect.width * rect.height * 4);
-
-    for (int row = 0; row < rect.height; row++) {
-      final int srcOffset = ((sourceY + row) * _frameBufferWidth + sourceX) * 4;
-      final int tmpOffset = row * rowBytes;
-      if (srcOffset + rowBytes <= fb.length && tmpOffset + rowBytes <= tempBuf.length) {
-        tempBuf.setRange(tmpOffset, tmpOffset + rowBytes, fb, srcOffset);
-      }
-    }
-
-    for (int row = 0; row < rect.height; row++) {
-      final int dstOffset = ((rect.y + row) * _frameBufferWidth + rect.x) * 4;
-      final int tmpOffset = row * rowBytes;
-      if (dstOffset + rowBytes <= fb.length && tmpOffset + rowBytes <= tempBuf.length) {
-        fb.setRange(dstOffset, dstOffset + rowBytes, tempBuf, tmpOffset);
-      }
-    }
-  }
-
-  /// 将帧缓冲区解码为 Flutter Image 并通知 UI（带并发保护）。
+  /// 从后台 Isolate 获取帧缓冲区快照，解码为 Flutter Image 并通知 UI。
   void _decodeAndNotify() {
-    if (_isDisposed || _isProcessingFrame) return;
-
-    final Uint8List? fb = _frameBuffer;
-    if (fb == null) return;
+    if (_isDisposed || _isProcessingFrame || !_fbProcessor.isReady) return;
 
     _isProcessingFrame = true;
     _lastFrameTime = DateTime.now();
 
-    ui.decodeImageFromPixels(
-      Uint8List.fromList(fb), // 传递副本，避免解码期间被修改
-      _frameBufferWidth,
-      _frameBufferHeight,
-      ui.PixelFormat.bgra8888,
-      (ui.Image image) {
+    _fbProcessor.snapshot().then((Uint8List? buffer) {
+      if (_isDisposed || buffer == null) {
         _isProcessingFrame = false;
-
-        if (_isDisposed) {
-          image.dispose();
-          return;
-        }
-
-        final ui.Image? oldImage = _currentImage;
-        _currentImage = image;
-        notifyListeners();
-        oldImage?.dispose();
-
         _client?.requestUpdate();
-      },
-    );
+        return;
+      }
+
+      ui.decodeImageFromPixels(
+        buffer,
+        _frameBufferWidth,
+        _frameBufferHeight,
+        ui.PixelFormat.bgra8888,
+        (ui.Image image) {
+          _isProcessingFrame = false;
+
+          if (_isDisposed) {
+            image.dispose();
+            return;
+          }
+
+          final ui.Image? oldImage = _currentImage;
+          _currentImage = image;
+          notifyListeners();
+          oldImage?.dispose();
+
+          _client?.requestUpdate();
+        },
+      );
+    }).catchError((Object error) {
+      _isProcessingFrame = false;
+      _logger.severe('Frame decode error: $error');
+      _client?.requestUpdate();
+    });
   }
 
   /// 清理所有资源。
@@ -419,7 +499,7 @@ class VncClientManager extends ChangeNotifier {
     await _client?.close();
     _client = null;
 
-    _frameBuffer = null;
+    _fbProcessor.dispose();
     _frameBufferWidth = 0;
     _frameBufferHeight = 0;
   }
