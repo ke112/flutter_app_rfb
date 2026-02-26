@@ -58,10 +58,7 @@ class _FrameBufferProcessor {
     final receiver = ReceivePort();
     try {
       _commandPort!.send(['snap', receiver.sendPort]);
-      final result = await receiver.first.timeout(
-        const Duration(milliseconds: 500),
-        onTimeout: () => null,
-      );
+      final result = await receiver.first.timeout(const Duration(milliseconds: 500), onTimeout: () => null);
       if (result is TransferableTypedData) {
         return result.materialize().asUint8List();
       }
@@ -117,9 +114,7 @@ class _FrameBufferProcessor {
         case 'snap':
           final replyPort = msg[1] as SendPort;
           if (fb != null) {
-            replyPort.send(
-              TransferableTypedData.fromList([Uint8List.fromList(fb!)]),
-            );
+            replyPort.send(TransferableTypedData.fromList([Uint8List.fromList(fb!)]));
           } else {
             replyPort.send(null);
           }
@@ -404,10 +399,7 @@ class VncClientManager extends ChangeNotifier {
             rectangle.width,
             rectangle.height,
             Uint8List.fromList(
-              rectangle.byteData.buffer.asUint8List(
-                rectangle.byteData.offsetInBytes,
-                rectangle.byteData.lengthInBytes,
-              ),
+              rectangle.byteData.buffer.asUint8List(rectangle.byteData.offsetInBytes, rectangle.byteData.lengthInBytes),
             ),
           ]);
         },
@@ -456,39 +448,38 @@ class VncClientManager extends ChangeNotifier {
     _isProcessingFrame = true;
     _lastFrameTime = DateTime.now();
 
-    _fbProcessor.snapshot().then((Uint8List? buffer) {
-      if (_isDisposed || buffer == null) {
-        _isProcessingFrame = false;
-        _client?.requestUpdate();
-        return;
-      }
-
-      ui.decodeImageFromPixels(
-        buffer,
-        _frameBufferWidth,
-        _frameBufferHeight,
-        ui.PixelFormat.bgra8888,
-        (ui.Image image) {
-          _isProcessingFrame = false;
-
-          if (_isDisposed) {
-            image.dispose();
+    _fbProcessor
+        .snapshot()
+        .then((Uint8List? buffer) {
+          if (_isDisposed || buffer == null) {
+            _isProcessingFrame = false;
+            _client?.requestUpdate();
             return;
           }
 
-          final ui.Image? oldImage = _currentImage;
-          _currentImage = image;
-          notifyListeners();
-          oldImage?.dispose();
+          ui.decodeImageFromPixels(buffer, _frameBufferWidth, _frameBufferHeight, ui.PixelFormat.bgra8888, (
+            ui.Image image,
+          ) {
+            _isProcessingFrame = false;
 
+            if (_isDisposed) {
+              image.dispose();
+              return;
+            }
+
+            final ui.Image? oldImage = _currentImage;
+            _currentImage = image;
+            notifyListeners();
+            oldImage?.dispose();
+
+            _client?.requestUpdate();
+          });
+        })
+        .catchError((Object error) {
+          _isProcessingFrame = false;
+          _logger.severe('Frame decode error: $error');
           _client?.requestUpdate();
-        },
-      );
-    }).catchError((Object error) {
-      _isProcessingFrame = false;
-      _logger.severe('Frame decode error: $error');
-      _client?.requestUpdate();
-    });
+        });
   }
 
   /// 清理所有资源。
