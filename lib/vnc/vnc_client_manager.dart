@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:ui' as ui;
 
@@ -200,14 +201,15 @@ class VncClientManager extends ChangeNotifier {
   /// 是否有待处理的帧更新（节流：处理期间来的更新合并为一次）。
   bool _hasPendingUpdate = false;
 
+  /// 节流延迟定时器，可在 pauseRendering 时取消以避免幽灵回调。
+  Timer? _pendingDelayTimer;
+
   /// 渲染是否已暂停（触摸交互期间暂停，以避免 setState 抖动）。
   bool _renderingPaused = false;
 
-  /// 暂停期间缓冲区是否有新数据写入（恢复时需要解码）。
-  bool _dirtyWhilePaused = false;
-
-  /// 帧率节流：最小帧间隔（约 20fps，降低移动设备 CPU 负载）。
-  static const Duration _minFrameInterval = Duration(milliseconds: 50);
+  /// 帧率节流：最小帧间隔。
+  /// Android 约 10fps 以减轻 CPU 负载；iOS 保持约 20fps。
+  static final Duration _minFrameInterval = Duration(milliseconds: Platform.isAndroid ? 100 : 50);
   DateTime _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 当前连接状态。
@@ -227,25 +229,24 @@ class VncClientManager extends ChangeNotifier {
 
   /// 暂停渲染（触摸开始时调用）。
   ///
-  /// 数据仍然发送到后台 Isolate 写入帧缓冲区，但不解码为 Image、不通知 UI。
+  /// 取消节流延迟定时器并设置暂停标志。流订阅保持活跃以维护
+  /// RFB 协议状态一致，但 [_onFrameBufferUpdate] 会直接丢弃数据。
   void pauseRendering() {
     _renderingPaused = true;
-    _dirtyWhilePaused = false;
+    _pendingDelayTimer?.cancel();
+    _pendingDelayTimer = null;
+    _hasPendingUpdate = false;
   }
 
   /// 恢复渲染（触摸结束一段时间后调用）。
   ///
-  /// 如果暂停期间有新数据，立即从 Isolate 获取快照并解码刷新画面；
-  /// 否则直接请求下一帧以重启更新循环。
+  /// 重置帧时间戳使下一帧立即解码（不受节流延迟），
+  /// 然后请求服务器推送新帧以重启更新链。
   void resumeRendering() {
     if (!_renderingPaused) return;
     _renderingPaused = false;
-    if (_dirtyWhilePaused) {
-      _dirtyWhilePaused = false;
-      _decodeAndNotify();
-    } else {
-      _client?.requestUpdate();
-    }
+    _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
+    _client?.requestUpdate();
   }
 
   /// 连接到 VNC 服务器。
@@ -338,7 +339,6 @@ class VncClientManager extends ChangeNotifier {
   void dispose() {
     _isDisposed = true;
     _cleanup();
-    _currentImage?.dispose();
     _currentImage = null;
     super.dispose();
   }
@@ -374,7 +374,7 @@ class VncClientManager extends ChangeNotifier {
   /// 矩形像素数据序列化后发送到后台 Isolate 处理，
   /// 主线程只做轻量级数据封装，不执行任何像素操作。
   void _onFrameBufferUpdate(RemoteFrameBufferClientUpdate update) {
-    if (_isDisposed || !_fbProcessor.isReady) return;
+    if (_isDisposed || !_fbProcessor.isReady || _renderingPaused) return;
 
     final List<List<Object>> serializedRects = [];
     for (final rectangle in update.rectangles) {
@@ -414,24 +414,15 @@ class VncClientManager extends ChangeNotifier {
 
     _fbProcessor.applyRects(serializedRects);
 
-    if (_renderingPaused) {
-      _dirtyWhilePaused = true;
-      _client?.requestUpdate();
-      return;
-    }
-
     final now = DateTime.now();
     if (now.difference(_lastFrameTime) < _minFrameInterval) {
       if (!_hasPendingUpdate) {
         _hasPendingUpdate = true;
-        Future.delayed(_minFrameInterval, () {
+        _pendingDelayTimer?.cancel();
+        _pendingDelayTimer = Timer(_minFrameInterval, () {
+          _pendingDelayTimer = null;
           if (_isDisposed) return;
           _hasPendingUpdate = false;
-          if (_renderingPaused) {
-            _dirtyWhilePaused = true;
-            _client?.requestUpdate();
-            return;
-          }
           _decodeAndNotify();
         });
       }
@@ -463,14 +454,11 @@ class VncClientManager extends ChangeNotifier {
             _isProcessingFrame = false;
 
             if (_isDisposed) {
-              image.dispose();
               return;
             }
 
-            final ui.Image? oldImage = _currentImage;
             _currentImage = image;
             notifyListeners();
-            oldImage?.dispose();
 
             _client?.requestUpdate();
           });
@@ -484,6 +472,8 @@ class VncClientManager extends ChangeNotifier {
 
   /// 清理所有资源。
   Future<void> _cleanup() async {
+    _pendingDelayTimer?.cancel();
+    _pendingDelayTimer = null;
     await _updateSubscription?.cancel();
     _updateSubscription = null;
 

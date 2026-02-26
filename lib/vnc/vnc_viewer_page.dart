@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -43,8 +44,9 @@ class _VncViewerPageState extends State<VncViewerPage> {
   /// 手指全部抬起后，延迟恢复渲染的定时器。
   Timer? _resumeTimer;
 
-  /// 手指离开后恢复渲染的延迟时间（缩短以减少恢复等待感）。
-  static const Duration _resumeDelay = Duration(milliseconds: 150);
+  /// 手指离开后恢复渲染的延迟时间。
+  /// Android 加大延迟以避免频繁暂停/恢复带来的性能抖动；iOS 保持较短延迟。
+  static final Duration _resumeDelay = Duration(milliseconds: Platform.isAndroid ? 1000 : 150);
 
   @override
   void initState() {
